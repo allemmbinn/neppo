@@ -65,7 +65,6 @@ class Hyperparameters:
     ensemble_disagreement_N: int = 5
     ensemble_disagreement_alpha: float = 0.1
 
-
 class EnsemblePhiWrapper:
     """Wrapper that provides same interface as single phi but uses ensemble with variance penalty."""
 
@@ -85,7 +84,6 @@ class EnsemblePhiWrapper:
 
     def named_parameters(self):
         return self.phi_ensemble[0].named_parameters()
-
 
 def get_trajectory_indices(done):
     """

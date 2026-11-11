@@ -73,7 +73,7 @@ CONFIG = {
         "max_steps": 25,
     },
     "seed": None,
-    "device": "cuda",
+    "device": "cpu",
 }
 
 WANDB_KWARGS = {
@@ -310,7 +310,7 @@ if __name__ == "__main__":
 
     parser = argparse.ArgumentParser()
     parser.add_argument("--test", action="store_true")
-    parser.add_argument("--device", type=str, default="cuda")
+    parser.add_argument("--device", type=str, default="cpu")
     parser.add_argument("--gpu_num", type=int, default=0)
     parser.add_argument("--env", type=str, default=None)
     parser.add_argument("--num_epochs", type=int, default=None)
