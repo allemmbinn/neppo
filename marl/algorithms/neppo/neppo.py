@@ -65,6 +65,9 @@ class Hyperparameters:
     ensemble_disagreement_N: int = 5
     ensemble_disagreement_alpha: float = 0.1
 
+    # potmax solver: "ppo" (StepTrain.pm, HAPPO-ordered PPO) or "ddpl" (DDPLPotMax, built by the runner)
+    pm_solver: str = "ppo"
+
 
 class EnsemblePhiWrapper:
     """Wrapper that provides same interface as single phi but uses ensemble with variance penalty."""
@@ -130,7 +133,7 @@ def bootstrap_trajectories(td, done_key="next/done"):
 
 
 class NePPO:
-    def __init__(self, actors, pm_critic, br_critics, phi, device, **hp):
+    def __init__(self, actors, pm_critic, br_critics, phi, device, pm_step=None, **hp):
         self.hp = Hyperparameters(**hp)
         self.num_actors = len(actors)
 
@@ -169,7 +172,10 @@ class NePPO:
         else:
             self.phi_target = None
 
-        self.pm = StepTrain(self.hp, self.num_actors)
+        if (pm_step is not None) != (self.hp.pm_solver != "ppo"):
+            raise ValueError(f"pm_solver={self.hp.pm_solver!r} needs pm_step exactly when it is not 'ppo'")
+        # a non-PPO pm solver (DDPLPotMax) owns its actors/critics; BR keeps the PPO actors
+        self.pm = StepTrain(self.hp, self.num_actors) if pm_step is None else pm_step
         self.br = StepTrain(self.hp, self.num_actors)
 
         self.hat_pm = None
@@ -184,12 +190,15 @@ class NePPO:
             phi_for_training = self.phi_target
         else:
             phi_for_training = phi
-        self.pm.copy_networks(
-            actors=actors,
-            pm_critic=pm_critic,
-            br_critics=br_critics,
-            phi=phi_for_training,
-        )
+        if pm_step is None:
+            self.pm.copy_networks(
+                actors=actors,
+                pm_critic=pm_critic,
+                br_critics=br_critics,
+                phi=phi_for_training,
+            )
+        else:
+            self.pm.copy_networks(phi=phi_for_training)
         self.br.copy_networks(
             actors=actors,
             pm_critic=pm_critic,
@@ -216,10 +225,12 @@ class NePPO:
     @property
     def current_policies(self):
         match self.branch:
+            # pm rollouts: a DDPL pm in reference mode collects with its fixed pi_ref; BR/potdiff below
+            # always use pm.actors, the learned potmax policy
             case 0:  # potmax
-                return self.pm.actors
+                return getattr(self.pm, "rollout_policies", self.pm.actors)
             case 1:  # potmax hat
-                return self.hat_pm.actors
+                return getattr(self.hat_pm, "rollout_policies", self.hat_pm.actors)
             case 2:  # br
                 actors = [actor for actor in self.pm.actors]
                 i = self.br.actor_order[self.br.actor_order_i]

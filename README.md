@@ -20,8 +20,11 @@ pip install -e .
 ```
 
 Requires Python ≥ 3.10. Rollout collection and PPO / IPPO / MAPPO training come from
-[jaxtrl](https://github.com/adkala/jaxtrl) (JAX-jitted env stepping, TorchRL updates), which
-`pip` pulls from GitHub pinned to the commit used for the paper. Other core dependencies:
+[jaxtrl](https://github.com/adkala/jaxtrl) (JAX-jitted env stepping, TorchRL updates). On this branch `pip`
+pulls the fork [allemmbinn/jaxtrl](https://github.com/allemmbinn/jaxtrl) at a pinned commit that adds the DDPL
+potmax solver (`--pm_solver ddpl`, `--ddpl_reference <ckpt>`); the paper used `adkala/jaxtrl@03ca19b`. To develop
+against a local checkout next to this repo, run `pip install -e ../jaxtrl` after `pip install -e .`.
+Other core dependencies:
 `jaxmarl`, `torchrl`, `tensordict`, `flax`. `matrix_neppo.py` needs only `numpy` (`pip install -e .[plots]` adds
 `matplotlib` for `--plot`). Training logs go to Weights & Biases; set `WANDB_MODE=offline`
 (or `disabled`) to run without an account. The RL scripts accept `--test` for a fast CPU

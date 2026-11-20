@@ -6,8 +6,10 @@ readme = "README.md"
 requires-python = ">=3.10"
 license = {text = "MIT"}
 dependencies = [
-    # jaxtrl is not on PyPI; pinned to the commit the paper code was run against
-    "jaxtrl @ git+https://github.com/adkala/jaxtrl@03ca19bd5f199b7c626924049354f0b5053d3bed",
+    # jaxtrl is not on PyPI. Pinned to the fork commit that adds DDPL (branch diffusion_coord_solver), which
+    # --pm_solver ddpl needs. The paper results used github.com/adkala/jaxtrl@03ca19bd5f199b7c626924049354f0b5053d3bed.
+    # For development against a local checkout: pip install -e ../jaxtrl (overrides this pin).
+    "jaxtrl @ git+https://github.com/allemmbinn/jaxtrl@d95fad47283f219b31c8246c8553bb8202ba3e01",
     "jax>=0.4.30",
     "jaxmarl>=0.1.0",
     "torch>=2.0.0",
@@ -33,7 +35,8 @@ include = ["marl*"]
 
 [project.urls]
 Paper = "https://arxiv.org/abs/2603.06977"
-RL-library = "https://github.com/adkala/jaxtrl"
+RL-library = "https://github.com/allemmbinn/jaxtrl"
+RL-library-upstream = "https://github.com/adkala/jaxtrl"
 
 [project.optional-dependencies]
 plots = ["matplotlib"]

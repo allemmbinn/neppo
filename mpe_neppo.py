@@ -1,6 +1,10 @@
 import os
 import time
 
+# JAX (collector, DDPL nets + replay) and Torch (PPO/BR critics, phi) share one GPU. JAX's default grabs 75%
+# of device memory up front, which starves Torch; allocate on demand instead. Set it in the shell to override.
+os.environ.setdefault("XLA_PYTHON_CLIENT_PREALLOCATE", "false")
+
 import jax
 import numpy as np
 import torch as th
@@ -48,6 +52,39 @@ CONFIG = {
             "mixer": True,
             "mixer_input_dim": 20,
             "mixer_output_dim": 3,
+            # potmax solver: "ppo" (default, unchanged) or "ddpl" (diffusion policies, see "ddpl" below)
+            "pm_solver": "ppo",
+        },
+        # used only when pm_solver == "ddpl" (marl/algorithms/neppo/ddpl_pm.py); gamma comes from algo_kwargs
+        "ddpl": {
+            "episode_len": None,  # set from env max_steps in train()
+            "jax_device": None,  # None -> JAX default device
+            # fixed reference policy pi_ref (dir with {agent.name}.pth, e.g. an IPPO checkpoint). When set, pi_ref
+            # collects every pm rollout and proposes every DDPL candidate (proposal="reference"); BR opponents
+            # and potdiff still use the learned DDPL actor. None -> paper mode (proposals from theta^{k-1}).
+            "reference_path": None,
+            "reference_actor_kwargs": None,  # None -> ddpl_pm.REFERENCE_ACTOR_KWARGS (MLP 64x64 relu, tanh)
+            # reference mode only: replaces ddpl_kwargs.buffer_capacity. pi_ref is fixed, so old data never goes
+            # stale and 1M (paper) is not needed; ~4.8 GB per 1M transitions on world_comm, and hat_pm holds a
+            # second copy. None -> keep ddpl_kwargs.buffer_capacity.
+            "reference_buffer_capacity": 300_000,
+            # reference mode only: after every N-th pm update, one extra rollout with the LEARNED DDPL actors,
+            # logged as pm_eval/* (the pm/* rollout metrics describe pi_ref there). 0 disables.
+            "eval_learned_every": 1,
+            "ddpl_kwargs": {
+                "sampler_preset": "jaxddpm",  # [DECISION] paper sampler does not learn (jaxtrl docs/ddpl_usage.md §9)
+                "weight_mode": "global_max",  # [DECISION] literal exp(eta/(1-gamma) Q) overflows on MPE
+                # weights exp(eta/(1-gamma) Q) ~ exp(67 eta Q): eta=1 is near-argmax over candidates. Tune with
+                # pm/train/ess_mean (aim ~20-50% of num_candidates). See jaxtrl docs/ddpl_neppo_decisions.md
+                "eta": 0.1,
+                "hidden_sizes": [256, 256, 256],
+                "batch_size": 256,
+                "num_candidates": 16,
+                "rollout_batch_size": 20,  # epochs per pm step = rollout size / 20
+                "learning_starts": 256,
+                "buffer_capacity": 1_000_000,
+                "lr_decay_updates": 250_000,
+            },
         },
         "actor_kwargs": {
             # one hidden layer, the architecture of the shipped Table 2 weights (pretrained/neppo_mixer_wc)
@@ -144,50 +181,35 @@ def train(
 
     sim = JaxMARLSim(env, agents, rewards, ENV_MAX_STEPS)
 
+    config["trainer"]["ddpl"]["episode_len"] = ENV_MAX_STEPS
     runner = NePPORunner(agents, config["trainer"], key, device=config["device"])
 
-    policy = PolicyAggregator(runner.policies)
-    key, sk = jax.random.split(key)
-    policy_context = policy.init_context(sk)
+    # The jitted collector fixes each slot's policy CODE; weights flow through the contexts. With a
+    # DDPL pm and PPO BR actors the slot types change between branches, so keep one compiled
+    # collector per policy-type signature (N + 1 of them). For pm_solver="ppo" there is exactly one.
+    collectors = {}
 
-    collect = collect_factory(
-        sim.reset,
-        sim.step,
-        policy,
-        timesteps_per_env=TIMESTEPS_PER_ENV,
-        num_envs=config["collect"]["num_envs"],
-        extended_transition=True,
-    )
-    collect = jax.jit(collect)
+    # pi_ref is an MLPActor like the BR actors but with its own architecture, so it gets its own slot key
+    ref_ids = {id(p) for p in (getattr(runner.algo.pm, "reference_policies", None) or [])}
 
-    logger = ExtWandbLogger(
-        exp_name=exp_name,
-        **{
-            **wandb_kwargs,
-            "project": "neppo",
-            "config": config,
-        },
-    )
+    def get_collect(policies):
+        sig = tuple(("ref", id(p)) if id(p) in ref_ids else type(p) for p in policies)
+        if sig not in collectors:
+            collectors[sig] = jax.jit(
+                collect_factory(
+                    sim.reset,
+                    sim.step,
+                    PolicyAggregator(list(policies)),
+                    timesteps_per_env=TIMESTEPS_PER_ENV,
+                    num_envs=config["collect"]["num_envs"],
+                    extended_transition=True,
+                )
+            )
+        return collectors[sig]
 
-    start_time = time.time()
-    total_frames = 0
-    next_save_frame = config["save"]["freq"]
-    num_env_steps = config.get("num_env_steps", None)
-
-    print("starting loop")
-    while True:
-        key, sk = jax.random.split(key)
-        policy_contexts = runner.get_policy_contexts(sk)
-        policy_context[:] = policy_contexts
-
-        # collect
-        key, sk = jax.random.split(key)
-        collect_start_time = time.time()
-        transitions = collect(sk, policy_context)
-        collect_end_time = time.time()
-
+    def prepare_tds(transitions):
+        """Per-agent tensordicts with the global state (critic / phi input) added."""
         tds = transitions_to_tensordicts(transitions)
-        total_frames += transitions.step_count.shape[0]
 
         # Add state for critic
         state_obs, _ = jax.vmap(state_agent.obs_env2pi)(transitions.raw_obs)
@@ -215,6 +237,45 @@ def train(
             tds[i]["state"] = state_obs
             tds[i]["next", "state"] = state_next_obs
 
+        return tds
+
+    ddpl_cfg = config["trainer"]["ddpl"]
+    ref_eval_every = (
+        int(ddpl_cfg.get("eval_learned_every") or 0)
+        if config["trainer"]["algo_kwargs"].get("pm_solver", "ppo") == "ddpl" and ddpl_cfg.get("reference_path")
+        else 0
+    )
+    pm_updates = 0
+
+    logger = ExtWandbLogger(
+        exp_name=exp_name,
+        **{
+            **wandb_kwargs,
+            "project": "neppo",
+            "config": config,
+        },
+    )
+
+    start_time = time.time()
+    total_frames = 0
+    next_save_frame = config["save"]["freq"]
+    num_env_steps = config.get("num_env_steps", None)
+
+    print("starting loop")
+    while True:
+        key, sk = jax.random.split(key)
+        policy_context = runner.get_policy_contexts(sk)
+        collect = get_collect(runner.policies)
+
+        # collect
+        key, sk = jax.random.split(key)
+        collect_start_time = time.time()
+        transitions = collect(sk, policy_context)
+        collect_end_time = time.time()
+
+        tds = prepare_tds(transitions)
+        total_frames += transitions.step_count.shape[0]
+
         rewards_cache = {}
         for i in range(len(tds)):
             rewards_cache[i] = tds[i]["next", "reward"]
@@ -223,6 +284,26 @@ def train(
         train_start_time = time.time()
         log_dict = runner.step(tds)
         train_end_time = time.time()
+
+        # reference mode: the pm rollout above was pi_ref's; measure the LEARNED potmax policy separately
+        if ref_eval_every and log_dict["debug/branch"] == 0:
+            pm_updates += 1
+            if pm_updates % ref_eval_every == 0:
+                eval_start_time = time.time()
+                pm = runner.algo.pm
+                key, ck, sk = jax.random.split(key, 3)
+                eval_ctx = [p.init_context(k) for p, k in zip(pm.actors, jax.random.split(ck, len(pm.actors)))]
+                eval_tr = get_collect(pm.actors)(sk, eval_ctx)
+                eval_tds = prepare_tds(eval_tr)
+                log_dict |= pm.evaluate_phi(eval_tds, "pm_eval")
+                for j in range(len(eval_tds)):
+                    log_dict |= {
+                        f"pm_eval/rollout/{j}/{k}": v
+                        for k, v in get_rollout_stats(eval_tds[j], include_len=j == 0).items()
+                    }
+                log_dict["time/eval_sec"] = time.time() - eval_start_time
+                log_dict["time/eval_frames"] = int(eval_tr.step_count.shape[0])  # not in total_frames
+                del eval_tr, eval_tds
 
         # logging
         pre = ""
@@ -271,31 +352,35 @@ def train(
         # save
         if total_frames >= next_save_frame:
             next_save_frame += config["save"]["freq"]
-            for i, agent in enumerate(agents):
-                save_actor(
-                    runner.algo.pm.actors[i].trl_actor,
-                    f"{save_dir}/actor_{total_frames}/{agent.name}.pth",
-                )
-                # phi in the zonp class
-                save_actor(
-                    runner.algo.phi,
-                    f"{save_dir}/actor_{total_frames}/phi.pth",
-                )
+            if config["trainer"]["algo_kwargs"].get("pm_solver", "ppo") == "ddpl":
+                runner.algo.pm.save(f"{save_dir}/actor_{total_frames}/pm_ddpl")
+                save_actor(runner.algo.phi, f"{save_dir}/actor_{total_frames}/phi.pth")
+            else:
+                for i, agent in enumerate(agents):
+                    save_actor(
+                        runner.algo.pm.actors[i].trl_actor,
+                        f"{save_dir}/actor_{total_frames}/{agent.name}.pth",
+                    )
+                    # phi in the zonp class
+                    save_actor(
+                        runner.algo.phi,
+                        f"{save_dir}/actor_{total_frames}/phi.pth",
+                    )
 
-                save_actor(
-                    runner.algo.pm.actor_optims,
-                    f"{save_dir}/actor_{total_frames}/actor_optims.pth",
-                )
+                    save_actor(
+                        runner.algo.pm.actor_optims,
+                        f"{save_dir}/actor_{total_frames}/actor_optims.pth",
+                    )
 
-                save_actor(
-                    runner.algo.pm.pm_critic,
-                    f"{save_dir}/actor_{total_frames}/pm_critic.pth",
-                )
+                    save_actor(
+                        runner.algo.pm.pm_critic,
+                        f"{save_dir}/actor_{total_frames}/pm_critic.pth",
+                    )
 
-                save_actor(
-                    runner.algo.pm.pm_critic_optim,
-                    f"{save_dir}/actor_{total_frames}/pm_critic_optim.pth",
-                )
+                    save_actor(
+                        runner.algo.pm.pm_critic_optim,
+                        f"{save_dir}/actor_{total_frames}/pm_critic_optim.pth",
+                    )
 
 
         del transitions
@@ -328,7 +413,25 @@ if __name__ == "__main__":
     parser.add_argument("--entropy_eps", type=float, default=None)
     parser.add_argument("--gamma", type=float, default=None)
     parser.add_argument("--num_env_steps", type=int, default=None)
+    parser.add_argument("--pm_solver", type=str, default=None, choices=["ppo", "ddpl"])
+    parser.add_argument("--ddpl_reference", type=str, default=None,
+                        help="checkpoint dir for a fixed DDPL reference policy pi_ref (implies --pm_solver ddpl)")
+    parser.add_argument("--ddpl_eta", type=float, default=None)
+    parser.add_argument("--ddpl_buffer_capacity", type=int, default=None,
+                        help="DDPL replay capacity (overrides the reference-mode default too)")
     args = parser.parse_args()
+    if args.ddpl_reference is not None:
+        if args.pm_solver == "ppo":
+            parser.error("--ddpl_reference needs --pm_solver ddpl")
+        args.pm_solver = "ddpl"
+        CONFIG["trainer"]["ddpl"]["reference_path"] = args.ddpl_reference
+    if args.ddpl_eta is not None:
+        CONFIG["trainer"]["ddpl"]["ddpl_kwargs"]["eta"] = args.ddpl_eta
+    if args.ddpl_buffer_capacity is not None:
+        CONFIG["trainer"]["ddpl"]["ddpl_kwargs"]["buffer_capacity"] = args.ddpl_buffer_capacity
+        CONFIG["trainer"]["ddpl"]["reference_buffer_capacity"] = None
+    if args.pm_solver is not None:
+        CONFIG["trainer"]["algo_kwargs"]["pm_solver"] = args.pm_solver
     if args.env is not None:
         CONFIG["env"]["name"] = args.env
     if args.num_envs is not None:

@@ -12,7 +12,7 @@ from marl.algorithms.neppo.mixer import (
     NPMixerWithDelta,
     NPNoMix,
 )
-from marl.algorithms.neppo.neppo import NePPO
+from marl.algorithms.neppo.neppo import Hyperparameters, NePPO
 
 
 class NePPORunner:
@@ -91,7 +91,40 @@ class NePPORunner:
 
         phi = phi.to(device)
 
-        self.algo = NePPO(actors, pm_critic, br_critics, phi, device, **algo_kwargs)
+        pm_step = None
+        if algo_kwargs.get("pm_solver", "ppo") == "ddpl":
+            from marl.algorithms.neppo.ddpl_pm import DDPLPotMax, load_reference_policies
+
+            ddpl = config["ddpl"]
+            ddpl_kwargs = dict(ddpl.get("ddpl_kwargs", {}))
+            pm_key, ref_key = jax.random.split(keys[-1])
+            refs = ref_ctx = None
+            if ddpl.get("reference_path"):
+                # fixed pi_ref (e.g. an IPPO checkpoint): collects the pm rollouts and proposes the candidates
+                if ddpl_kwargs.setdefault("proposal", "reference") != "reference":
+                    raise ValueError("ddpl.reference_path needs ddpl_kwargs.proposal='reference'")
+                refs = load_reference_policies(
+                    agents, ddpl["reference_path"], ref_key, ddpl.get("reference_actor_kwargs")
+                )
+                ref_ctx = [r.init_context(None) for r in refs]
+                if ddpl.get("reference_buffer_capacity"):  # fixed pi_ref: a smaller replay suffices
+                    ddpl_kwargs["buffer_capacity"] = int(ddpl["reference_buffer_capacity"])
+            pm_step = DDPLPotMax(
+                Hyperparameters(**algo_kwargs),
+                agents,
+                phi,
+                ddpl_kwargs,
+                pm_key,
+                episode_len=ddpl["episode_len"],
+                phi_dim=algo_kwargs["mixer_input_dim"],
+                device=ddpl.get("jax_device"),
+                reference_policies=refs,
+                reference_contexts=ref_ctx,
+            )
+
+        self.algo = NePPO(
+            actors, pm_critic, br_critics, phi, device, pm_step=pm_step, **algo_kwargs
+        )
 
     def step(self, tds):
         return self.algo.step(tds)
